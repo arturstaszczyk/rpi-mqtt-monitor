@@ -20,23 +20,12 @@ import html
 import uuid
 import glob
 import requests
-import configparser
-import psutil
 #import external sensor lib only if one uses external sensors
 if config.ext_sensors:
     # append folder ext_sensor_lib
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ext_sensor_lib')))
     import ds18b20
     from sht21 import SHT21
-
-
-configlanguage = configparser.ConfigParser()
-configlanguage.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'translations.ini'))
-
-def get_translation(key):
-    """ get the correct translation"""
-    return configlanguage.get(config.language, key, fallback=key)
-
 
 def check_wifi_signal(format):
     try:
@@ -52,7 +41,7 @@ def check_wifi_signal(format):
             wifi_signal = round((int(wifi_signal) / 70)* 100)
 
     except Exception:
-        wifi_signal = None if config.use_availability else 0
+        wifi_signal = 0
 
     return wifi_signal
 
@@ -67,7 +56,16 @@ def check_used_space(path):
 
 
 def check_cpu_load():
-    return psutil.cpu_percent(interval=1)
+    p = subprocess.Popen("uptime", shell=True, stdout=subprocess.PIPE).communicate()[0]
+    cores = subprocess.Popen("nproc", shell=True, stdout=subprocess.PIPE).communicate()[0]
+    try:
+        cpu_load = str(p).split("average:")[1].split(", ")[0].replace(' ', '').replace(',', '.')
+        cpu_load = float(cpu_load) / int(cores) * 100
+        cpu_load = round(float(cpu_load), 1)
+    except Exception:
+        cpu_load = 0
+
+    return cpu_load
 
 
 def check_voltage():
@@ -76,7 +74,7 @@ def check_voltage():
         voltage = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
         voltage = voltage.strip()[:-1]
     except Exception:
-        voltage = None if config.use_availability else 0
+        voltage = 0
 
     return voltage.decode('utf8')
 
@@ -115,27 +113,6 @@ def check_rpi_power_status():
         return "Error: " + str(e)
 
 
-def check_service_file_exists():
-    service_file_path = "/etc/systemd/system/rpi-mqtt-monitor.service"
-    return os.path.exists(service_file_path)
-
-
-def check_crontab_entry(script_name="rpi-cpu2mqtt.py"):
-    try:
-        # Get the current user's crontab
-        result = subprocess.run(['crontab', '-l'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        # If the crontab command fails, it means there is no crontab for the user
-        if result.returncode != 0:
-            return False
-        
-        # Check if the script name is in the crontab output
-        return script_name in result.stdout
-    except Exception as e:
-        print(f"Error checking crontab: {e}")
-        return False
-    
-
 def read_ext_sensors():
     """
     here we read the external sensors
@@ -161,8 +138,6 @@ def read_ext_sensors():
             # in case that some error occurs during reading, we get -300
             if temp==-300:
                 print ("Error while reading sensor %s, %s" % (item[1], item[2]))
-                if config.use_availability:
-                    item[3] = None
         if item[1] == "sht21":
             try:
                 with SHT21(1) as sht21:
@@ -174,31 +149,49 @@ def read_ext_sensors():
             # in case we have any problems to read the sensor, we continue and keep default values
             except Exception:
                 print ("Error while reading sensor %s" % item[1])
-                if config.use_availability:
-                    item[3] = [None, None]
-    #print (ext_sensors)
+    print (ext_sensors)
     return ext_sensors
 
 
 def check_cpu_temp():
+    full_cmd = f"awk '{{printf (\"%.2f\\n\", $1/1000); }}' $(for zone in /sys/class/thermal/thermal_zone*/; do grep -iq \"{config.cpu_thermal_zone}\" \"${{zone}}type\" && echo \"${{zone}}temp\"; done)"    
     try:
-        temps = psutil.sensors_temperatures()
-        if not temps:
-            raise ValueError("No temperature sensors found.")
+        p = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0]
+        cpu_temp = p.decode("utf-8").strip().replace(",", ".")
+    except Exception:
+        cpu_temp = 0
 
-        if config.cpu_thermal_zone in temps:
-            cpu_temp = temps[config.cpu_thermal_zone][0].current
-        elif "cpu_thermal" in temps:
-            cpu_temp = temps["cpu_thermal"][0].current
-        elif "coretemp" in temps:
-            cpu_temp = temps["coretemp"][0].current
-        else:
-            raise ValueError("CPU temperature sensor not found.")
+    return cpu_temp
 
-        return round(cpu_temp, 2) 
-    except Exception as e:
-        print(f"Error reading CPU temperature: {e}")
-        return None if config.use_availability else 0
+def check_raid_status():
+    """
+    Look at /proc/mdstat and return
+      * 'OK'        – all arrays active and clean
+      * 'DEGRADED'  – at least one array has missing or faulty disks
+      * 'NONE'      – no md arrays found
+      * 'ERROR'     – could not read /proc/mdstat
+    """
+    try:
+        with open('/proc/mdstat', 'r', encoding='utf‑8') as f:
+            lines = f.readlines()
+    except Exception:
+        return "ERROR"
+
+    arrays = [l for l in lines if l.startswith('md')]
+    if not arrays:
+        return "NONE"
+
+    degraded = False
+    for line in arrays:
+        # md0 : active raid1 sda1[0] sdb1[1]
+        #           ^^^^^^ state token we need
+        tokens = line.split()
+        state  = tokens[3] if len(tokens) > 3 else ''
+        if state in ('inactive',) or '_' in line:   # '_'' marks a missing disk
+            degraded = True
+            break
+
+    return "DEGRADED" if degraded else "OK"
 
 
 def check_sys_clock_speed():
@@ -211,11 +204,9 @@ def check_sys_clock_speed():
 def check_uptime(format):
     if format == 'timestamp':
         full_cmd = "uptime -s"
-        tz_cmd = "date +%z"
-        tz_str = subprocess.Popen(tz_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0].decode('utf-8').strip()
         timestamp_str = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE).communicate()[0].decode('utf-8').strip()
         timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-        iso_timestamp = timestamp.isoformat() + tz_str  # Append correct offset to indicate `local` time
+        iso_timestamp = timestamp.isoformat() + 'Z'  # Append 'Z' to indicate UTC time
         return iso_timestamp
     else:
         full_cmd = "awk '{print int($1"+format+")}' /proc/uptime"
@@ -232,7 +223,7 @@ def check_model_name():
         try:
             model_name = model_name.split(':')[1].replace('\n', '')
         except Exception:
-            model_name = None if config.use_availability else 'Unknown'
+            model_name = 'Unknown'
 
    return model_name
 
@@ -250,7 +241,7 @@ def get_os():
     try:
         pretty_name = pretty_name.split('=')[1].replace('"', '').replace('\n', '')
     except Exception:
-        pretty_name = None if config.use_availability else 'Unknown'
+        pretty_name = 'Unknown'
         
     return(pretty_name)
 
@@ -264,7 +255,7 @@ def get_manufacturer():
         else:
             pretty_name = 'Raspberry Pi'
     except Exception:
-        pretty_name = None if config.use_availability else 'Unknown'
+        pretty_name = 'Unknown'
         
     return(pretty_name)
 
@@ -299,7 +290,7 @@ def get_network_ip():
         s.connect(('10.255.255.255', 1))
         IP = s.getsockname()[0]
     except Exception:
-        IP = None if config.use_availability else '127.0.0.1'
+        IP = '127.0.0.1'
     finally:
         s.close()
     return IP
@@ -320,7 +311,7 @@ def get_apt_updates():
         updates_count = int(result.stdout.strip())
     except Exception as e:
         print(f"Error checking for updates: {e}")
-        updates_count = None if config.use_availability else 0
+        updates_count = 0
 
     return updates_count
 
@@ -374,22 +365,22 @@ def print_measured_values(monitored_values):
     output += "   Service Sleep Time: {} seconds\n".format(config.service_sleep_time)
     if config.update:
         output += "   Update Check Interval: {} seconds\n".format(config.update_check_interval)
-    # Add dynamic measured values with units
+      # Add dynamic measured values with units
     measured_values = {
-        get_translation("cpu_load"): ("cpu_load", "%"),
-        get_translation("cpu_temperature"): ("cpu_temp", "°C"),
-        get_translation("used_space"): ("used_space", "%"),
-        get_translation("voltage"): ("voltage", "V"),
-        get_translation("cpu_clock_speed"): ("sys_clock_speed", "MHz"),
-        get_translation("disk_swap"): ("swap", "%"),
-        get_translation("memory_usage"): ("memory", "%"),
-        get_translation("uptime"): ("uptime", ""),
-        get_translation("wifi_signal"): ("wifi_signal", "%"),
-        get_translation("wifi_signal_strength")+" [dBm]": ("wifi_signal_dbm", "dBm"),
-        get_translation("fan_speed"): ("rpi5_fan_speed", "RPM"),
-        get_translation("rpi_power_status"): ("rpi_power_status", ""),
-        get_translation("update"): ("update", ""),
-        get_translation("external_sensors"): ("ext_sensors", "")
+        "CPU Load": ("cpu_load", "%"),
+        "CPU Temp": ("cpu_temp", "°C"),
+        "Used Space": ("used_space", "%"),
+        "Voltage": ("voltage", "V"),
+        "CPU Clock Speed": ("sys_clock_speed", "MHz"),
+        "Swap": ("swap", "%"),
+        "Memory": ("memory", "%"),
+        "Online since": ("uptime", ""),
+        "Wifi Signal": ("wifi_signal", "%"),
+        "Wifi Signal dBm": ("wifi_signal_dbm", "dBm"),
+        "RPI5 Fan Speed": ("rpi5_fan_speed", "RPM"),
+        "RPI Power Status": ("rpi_power_status", ""),
+        "Update": ("update", ""),
+        "External Sensors": ("ext_sensors", "")
     }
 
     output += "\n:: Measured values\n"
@@ -397,18 +388,11 @@ def print_measured_values(monitored_values):
         if key in monitored_values:
             output += f"   {label}: {monitored_values[key]} {unit}\n"
 
-    if config.drive_temps:
-        drive_temps = check_all_drive_temps()
-        if len(drive_temps) > 0:
-            for device, temp in drive_temps.items():
-                output += f"   {device.capitalize()} Temp: {temp:.2f}°C\n"
-    output += "\n:: Scheduling\n "
+    drive_temps = check_all_drive_temps()
+    if len(drive_temps) > 0:
+        for device, temp in drive_temps.items():
+            output += f"   {device.capitalize()} Temp: {temp:.2f}°C\n"
 
-    if check_service_file_exists():
-        output += "  Running as Service\n"
-    if check_crontab_entry():
-        output += "  Running as Cron Job\n"
-        
     output += """\n:: Installation directory :: {}
 
 :: Release notes {}: 
@@ -430,7 +414,7 @@ def get_release_notes(version):
         response = subprocess.run(['curl', '-s', url], capture_output=True)
         release_notes = response.stdout.decode('utf-8').split("What's Changed")[1].split("</div>")[0].replace("</h2>","").split("<p>")[0]
     except Exception:
-        release_notes = None if config.use_availability else "No release notes available"
+        release_notes = "No release notes available"
 
     lines = extract_text(release_notes).split('\n')
     lines = ["   * "+ line for line in lines if line.strip() != ""]
@@ -465,81 +449,81 @@ def config_json(what_config, device="0", hass_api=False):
         }
     }
 
-    data["state_topic"] = config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + what_config
+    data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + what_config
     data["unique_id"] = hostname + "_" + what_config
     if what_config == "cpu_load":
         data["icon"] = "mdi:speedometer"
-        data["name"] = get_translation("cpu_load")
+        data["name"] = "CPU Usage"
         data["state_class"] = "measurement"
         data["unit_of_measurement"] = "%"
     elif what_config == "cpu_temp":
         data["icon"] = "hass:thermometer"
-        data["name"] = get_translation("cpu_temperature")
+        data["name"] = "CPU Temperature"
         data["unit_of_measurement"] = "°C"
         data["device_class"] = "temperature"
         data["state_class"] = "measurement"
     elif what_config == "used_space":
         data["icon"] = "mdi:harddisk"
-        data["name"] = get_translation("disk_usage")
+        data["name"] = "Disk Usage"
         data["unit_of_measurement"] = "%"
         data["state_class"] = "measurement"
     elif what_config == "voltage":
         data["icon"] = "mdi:flash"
-        data["name"] = get_translation("cpu_voltage")
+        data["name"] = "CPU Voltage"
         data["unit_of_measurement"] = "V"
         data["device_class"] = "voltage"
         data["state_class"] = "measurement"
     elif what_config == "swap":
         data["icon"] = "mdi:harddisk"
-        data["name"] = get_translation("disk_swap")
+        data["name"] = "Disk Swap"
         data["unit_of_measurement"] = "%"
         data["state_class"] = "measurement"
     elif what_config == "memory":
         data["icon"] = "mdi:memory"
-        data["name"] = get_translation("memory_usage")
+        data["name"] = "Memory Usage"
         data["unit_of_measurement"] = "%"
         data["state_class"] = "measurement"
     elif what_config == "sys_clock_speed":
         data["icon"] = "mdi:speedometer"
-        data["name"] = get_translation("cpu_clock_speed")
+        data["name"] = "CPU Clock Speed"
         data["unit_of_measurement"] = "MHz"
         data["device_class"] = "frequency"
         data["state_class"] = "measurement"
     elif what_config == "uptime":
         data["icon"] = "mdi:calendar"
-        data["name"] = get_translation("uptime")
+        data["name"] = "Uptime"
         data["value_template"] = "{{ as_datetime(value) }}"
         data["device_class"] = "timestamp"
     elif what_config == "uptime_seconds":
         data["icon"] = "mdi:timer-outline"
-        data["name"] = get_translation("uptime")
+        data["name"] = "Uptime"
         data["unit_of_measurement"] = "s"
         data["device_class"] = "duration"
         data["state_class"] = "total_increasing"
     elif what_config == "wifi_signal":
         data["icon"] = "mdi:wifi"
-        data["name"] = get_translation("wifi_signal")
+        data["name"] = "Wifi Signal"
         data["unit_of_measurement"] = "%"
         data["state_class"] = "measurement"
         data["device_class"] = "signal_strength"
     elif what_config == "wifi_signal_dbm":
         data["icon"] = "mdi:wifi"
-        data["name"] = get_translation("wifi_signal_strength")
+        data["name"] = "Wifi Signal"
         data["unit_of_measurement"] = "dBm"
         data["device_class"] = "signal_strength"
         data["state_class"] = "measurement"
     elif what_config == "rpi5_fan_speed":
         data["icon"] = "mdi:fan"
-        data["name"] = get_translation("fan_speed")
+        data["name"] = "Fan Speed"
         data["unit_of_measurement"] = "RPM"
         data["state_class"] = "measurement"
     elif what_config == "status":
         data["icon"] = "mdi:lan-connect"
-        data["name"] = get_translation("status")
+        data["name"] = "Status"
         data["value_template"] = "{{ 'online' if value == '1' else 'offline' }}"
     elif what_config == "git_update":
         data["icon"] = "mdi:git"
-        data["name"] = get_translation("rpi_mqtt_monitor")
+        data["name"] = "RPi MQTT Monitor"
         data["title"] = "Device Update"
         data["device_class"] = "update"
         data["state_class"] = "measurement"
@@ -547,9 +531,9 @@ def config_json(what_config, device="0", hass_api=False):
     elif what_config == "update":
         version = update.check_git_version_remote(script_dir)
         data["icon"] = "mdi:update"
-        data["name"] = get_translation("rpi_mqtt_monitor")
+        data["name"] = "RPi MQTT Monitor"
         data["title"] = "New Version"
-        data["state_topic"] = config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + "git_update"
+        data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + "git_update"
         data["value_template"] = "{{ {'installed_version': value_json.installed_ver, 'latest_version': value_json.new_ver } | to_json }}"
         data["device_class"] = "firmware"
         data["command_topic"] = config.mqtt_discovery_prefix + "/update/" + hostname + "/command"
@@ -559,98 +543,95 @@ def config_json(what_config, device="0", hass_api=False):
         data['release_summary'] = get_release_notes(version)
     elif what_config == "restart_button":
         data["icon"] = "mdi:restart"
-        data["name"] = get_translation("system_restart")
+        data["name"] = "System Restart"
         data["command_topic"] = config.mqtt_discovery_prefix + "/update/" + hostname + "/command"
         data["payload_press"] = "restart"
         data["device_class"] = "restart"
     elif what_config == "shutdown_button":
         data["icon"] = "mdi:power"
-        data["name"] = get_translation("system_shutdown")
+        data["name"] = "System Shutdown"
         data["command_topic"] = config.mqtt_discovery_prefix + "/update/" + hostname + "/command"
         data["payload_press"] = "shutdown"
         data["device_class"] = "restart"
     elif what_config == "display_on":
         data["icon"] = "mdi:monitor"
-        data["name"] = get_translation("monitor_on")
+        data["name"] = "Monitor ON"
         data["command_topic"] = config.mqtt_discovery_prefix + "/update/" + hostname + "/command"
         data["payload_press"] = "display_on"
         data["device_class"] = "restart"
     elif what_config == "display_off":
         data["icon"] = "mdi:monitor"
-        data["name"] = get_translation("monitor_off")
+        data["name"] = "Monitor OFF"
         data["command_topic"] = config.mqtt_discovery_prefix + "/update/" + hostname + "/command"
         data["payload_press"] = "display_off"
         data["device_class"] = "restart"
     elif what_config == device + "_temp":
         data["icon"] = "hass:thermometer"
-        data["name"] = device + " " + get_translation("temperature")
+        data["name"] = device + " Temperature"
         data["unit_of_measurement"] = "°C"
         data["device_class"] = "temperature"
         data["state_class"] = "measurement"
     elif what_config == "rpi_power_status":
         data["icon"] = "mdi:flash"
-        data["name"] = get_translation("rpi_power_status")
+        data["name"] = "RPi Power Status"  
     elif what_config == "apt_updates":
         data["icon"] = "mdi:update"
-        data["name"] = get_translation("apt_updates")    
+        data["name"] = "APT Updates"
     elif what_config == "ds18b20_status":
         data["icon"] = "hass:thermometer"
-        data["name"] = device + " " + get_translation("temperature")
+        data["name"] = device + " Temperature"
         data["unit_of_measurement"] = "°C"
         data["device_class"] = "temperature"
         data["state_class"] = "measurement"
         # we define again the state topic in order to get a unique state topic if we have two sensors of the same type
-        data["state_topic"] = config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
+        data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
         data["unique_id"] = hostname + "_" + what_config + "_" + device
     elif what_config == "sht21_temp_status":
         data["icon"] = "hass:thermometer"
-        data["name"] = device + " " + get_translation("temperature")
+        data["name"] = device + " Temperature"
         data["unit_of_measurement"] = "°C"
         data["device_class"] = "temperature"
         data["state_class"] = "measurement"
         # we define again the state topic in order to get a unique state topic if we have two sensors of the same type
-        data["state_topic"] = config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
+        data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
         data["unique_id"] = hostname + "_" + what_config + "_" + device
     elif what_config == "sht21_hum_status":
         data["icon"] = "mdi:water-percent"
-        data["name"] = device + " " + get_translation("humidity")
+        data["name"] = device + " Humidity"
         data["unit_of_measurement"] = "%"
         data["device_class"] = "temperature"
         data["state_class"] = "measurement"
         # we define again the state topic in order to get a unique state topic if we have two sensors of the same type
-        data["state_topic"] = config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
+        data["state_topic"] = config.mqtt_topic_prefix + "/" + hostname + "/" + what_config + "_" + device
         data["unique_id"] = hostname + "_" + what_config + "_" + device
-    
+    elif what_config == "raid_status":
+        data["icon"] = "mdi:harddisk"
+        data["name"] = device + " RAID_status"
+        data["state_class"] = "measurement"
+        data["device_class"] = "RAID present"
+
+
     else:
         return ""
     # Return our built discovery config
 
-    # If this is a "measurement" add expiry information and availability from config file
-    # exclude "git_update", since that is running with a different update rate :(
-    if "state_class" in data and data["state_class"] == "measurement" and what_config != "git_update":
-        if config.expire_after_time:
-            data["expire_after"] = config.expire_after_time
-        if config.use_availability:
-            data["availability_topic"] = data["state_topic"] + "_availability"
-    
     if hass_api:
         result = {
             "name": data["name"],
             "icon": data["icon"],
+            "state_class": data["state_class"],
         }
-        if "state_class" in data:
-            result["state_class"] = data["state_class"]
         if "unit_of_measurement" in data:
-            result["unit_of_measurement"] = data["unit_of_measurement"]
+            result["unit_of_measurement"] = data["unit_of_measurement"]      
         if "device_class" in data:
             result["device_class"] = data["device_class"]
         if "unique_id" in data:
-            result["unique_id"] = data["unique_id"]
+            result["unique_id"] = data["unique_id"] 
         if "value_template" in data:
-            result["value_template"] = data["value_template"]
-    
+            result["value_template"] = data["value_template"] 
+            
         return result
-    
+
     return json.dumps(data)
 
 
@@ -689,7 +670,7 @@ def publish_update_status_to_mqtt(git_update, apt_updates):
         if config.discovery_messages:
             client.publish(config.mqtt_discovery_prefix + "/binary_sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_git_update/config",
                            config_json('git_update'), qos=config.qos)
-        client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/git_update", git_update, qos=1, retain=config.retain)
+        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/git_update", git_update, qos=1, retain=config.retain)
 
     if config.update:
         if config.discovery_messages:
@@ -700,7 +681,7 @@ def publish_update_status_to_mqtt(git_update, apt_updates):
         if config.discovery_messages:
             client.publish(config.mqtt_discovery_prefix + "/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_apt_updates/config",
                            config_json('apt_updates'), qos=config.qos)
-        client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/apt_updates", apt_updates, qos=config.qos, retain=config.retain)
+        client.publish(config.mqtt_topic_prefix + "/" + hostname + "/apt_updates", apt_updates, qos=config.qos, retain=config.retain)
 
 
     # Wait for all messages to be delivered
@@ -760,9 +741,7 @@ def publish_to_mqtt(monitored_values):
             if config.discovery_messages:
                 client.publish(f"{config.mqtt_discovery_prefix}/sensor/{config.mqtt_topic_prefix}/{hostname}_{key}/config",
                             config_json(key), qos=config.qos)
-            if config.use_availability:
-                client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/{key}_availability", 'offline' if value is None else 'online', qos=config.qos)
-            client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/{key}", value, qos=config.qos, retain=config.retain)
+            client.publish(f"{config.mqtt_topic_prefix}/{hostname}/{key}", value, qos=config.qos, retain=config.retain)
 
   # Publish non standard values    
     if config.restart_button:
@@ -784,9 +763,7 @@ def publish_to_mqtt(monitored_values):
             if config.discovery_messages:
                 client.publish(config.mqtt_discovery_prefix + "/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_" + device + "_temp/config",
                            config_json(device + "_temp", device), qos=config.qos)
-            if config.use_availability:
-                client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/{device}_temp_availability", 'offline' if temp is None else 'online', qos=config.qos)
-            client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + device + "_temp", temp, qos=config.qos, retain=config.retain)
+            client.publish(config.mqtt_topic_prefix + "/" + hostname + "/" + device + "_temp", temp, qos=config.qos, retain=config.retain)
 
     if config.ext_sensors:
         # we loop through all sensors
@@ -800,9 +777,7 @@ def publish_to_mqtt(monitored_values):
                     client.publish(
                         config.mqtt_discovery_prefix + "/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_" + item[0] + "_status/config",
                         config_json('ds18b20_status', device=item[0]), qos=config.qos)
-                if config.use_availability:
-                    client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/ds18b20_status_{item[0]}_availability", 'offline' if item[3] is None else 'online', qos=config.qos)
-                client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + "ds18b20_status_" + item[0], item[3], qos=config.qos, retain=config.retain)
+                client.publish(config.mqtt_topic_prefix + "/" + hostname + "/" + "ds18b20_status_" + item[0], item[3], qos=config.qos, retain=config.retain)
             if item[1] == "sht21":
                 if config.discovery_messages:
                     # temperature
@@ -813,17 +788,14 @@ def publish_to_mqtt(monitored_values):
                     client.publish(
                         config.mqtt_discovery_prefix + "/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_" + item[0] + "_hum_status/config",
                         config_json('sht21_hum_status', device=item[0]), qos=config.qos)
-                if config.use_availability:
-                    client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/sht21_temp_status_{item[0]}_availability", 'offline' if item[3][0] is None else 'online', qos=config.qos)
-                    client.publish(f"{config.mqtt_uns_structure}{config.mqtt_topic_prefix}/{hostname}/sht21_hum_status_{item[0]}_availability", 'offline' if item[3][1] is None else 'online', qos=config.qos)
                 # temperature
-                client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + "sht21_temp_status_" + item[0], item[3][0], qos=config.qos, retain=config.retain)
+                client.publish(config.mqtt_topic_prefix + "/" + hostname + "/" + "sht21_temp_status_" + item[0], item[3][0], qos=config.qos, retain=config.retain)
                 # humidity
-                client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/" + "sht21_hum_status_" + item[0], item[3][1], qos=config.qos, retain=config.retain)
+                client.publish(config.mqtt_topic_prefix + "/" + hostname + "/" + "sht21_hum_status_" + item[0], item[3][1], qos=config.qos, retain=config.retain)
                 
     status_sensor_topic = config.mqtt_discovery_prefix + "/sensor/" + config.mqtt_topic_prefix + "/" + hostname + "_status/config"
     client.publish(status_sensor_topic, config_json('status'), qos=config.qos)
-    client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/status", "1", qos=config.qos, retain=config.retain)
+    client.publish(config.mqtt_topic_prefix + "/" + hostname + "/status", "1", qos=config.qos, retain=config.retain)
     
     while len(client._out_messages) > 0:
         time.sleep(0.1)
@@ -848,7 +820,7 @@ def bulk_publish_to_mqtt(monitored_values):
         return
 
     client.loop_start()
-    client.publish(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname, values_str, qos=config.qos, retain=config.retain)
+    client.publish(config.mqtt_topic_prefix + "/" + hostname, values_str, qos=config.qos, retain=config.retain)
 
     while len(client._out_messages) > 0:
         time.sleep(0.1)
@@ -869,7 +841,7 @@ def parse_arguments():
     parser.add_argument('-v', '--version',  action='store_true',  help='display installed version and exit', default=False)
     parser.add_argument('-u', '--update',   action='store_true',  help='update script and config then exit', default=False)
     parser.add_argument('-w', '--hass_wake', action='store_true', help='display Home assistant wake on lan configuration', default=False)
-    parser.add_argument('--uninstall', action='store_true', help='uninstall rpi-mqtt-monitor and remove all related files')
+
     args = parser.parse_args()
 
     if args.update:
@@ -956,6 +928,8 @@ def collect_monitored_values():
     if config.ext_sensors:
         ext_sensors = read_ext_sensors()
         monitored_values["ext_sensors"] = ext_sensors
+    if config.raid_status:
+        monitored_values["raid_status"] = check_raid_status()
 
     return monitored_values
 
@@ -1015,24 +989,6 @@ def update_status():
             break
 
 
-def uninstall_script():
-    """Call the remote_install.sh script to uninstall the application."""
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../remote_install.sh")
-    
-    if not os.path.exists(script_path):
-        print("Error: remote_install.sh script not found.")
-        return
-
-    try:
-        # Run the uninstall command
-        subprocess.run(["bash", script_path, "uninstall"], check=True)
-        print("Uninstallation process completed.")
-    except subprocess.CalledProcessError as e:
-        print(f"Error during uninstallation: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-
-
 def on_message(client, userdata, msg):
     global exit_flag, thread1, thread2
     print("Received message: ", msg.payload.decode())
@@ -1078,18 +1034,13 @@ else:
 
 if __name__ == '__main__':
     args = parse_arguments();
-
-    if args.uninstall:
-        uninstall_script()
-        sys.exit(0)
-
     if args.service:
         if not args.hass_api:
             client = paho.Client()
             client.username_pw_set(config.mqtt_user, config.mqtt_password)
             client.on_message = on_message
             # set will_set to send a message when the client disconnects
-            client.will_set(config.mqtt_uns_structure + config.mqtt_topic_prefix + "/" + hostname + "/status", "0", qos=config.qos, retain=config.retain)
+            client.will_set(config.mqtt_topic_prefix + "/" + hostname + "/status", "0", qos=config.qos, retain=config.retain)
             try:
                 client.connect(config.mqtt_host, int(config.mqtt_port))
             except Exception as e:
